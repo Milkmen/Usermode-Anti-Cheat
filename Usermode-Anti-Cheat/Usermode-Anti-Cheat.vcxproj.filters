@@ -1,0 +1,11 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <ClCompile Include="source\main.c" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="source\umac\umac.h" />
+    <ClInclude Include="source\umac\checks\debug.h" />
+    <ClInclude Include="source\umac\checks\handle.h" />
+  </ItemGroup>
+</Project>
