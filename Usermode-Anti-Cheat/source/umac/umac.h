@@ -38,15 +38,16 @@ static inline uint16_t umac_check_regular()
 #ifndef UMAC_NO_DEBUG_CHECKS
 	if(_umac_debugger_present()) vl |= UMAC_CHECK_DEBUGGER;
 #endif
-#ifndef UMAC_NO_HANDLE_CHECKS
-	if (_umac_check_handles()) vl |= UMAC_CHECK_HANDLE;
-#endif
 	return vl;
 }
 
-static inline void umac_check_intermittent()
+static inline uint16_t umac_check_intermittent()
 {
-	
+	uint16_t vl = 0;
+	#ifndef UMAC_NO_HANDLE_CHECKS
+		if (_umac_check_handles()) vl |= UMAC_CHECK_HANDLE;
+	#endif
+	return vl;
 }
 
 static inline void umac_shutdown()

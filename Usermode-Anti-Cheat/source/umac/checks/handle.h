@@ -3,30 +3,15 @@
 
 #ifdef _WIN32
 
-typedef NTSTATUS(WINAPI* pNtQuerySystemInformation)(
-    SYSTEM_INFORMATION_CLASS SystemInformationClass,
-    PVOID SystemInformation,
-    ULONG SystemInformationLength,
-    PULONG ReturnLength
-    );
+#include <Windows.h>
+#include <winternl.h>
+#include <tlhelp32.h> // For PROCESSENTRY32W and CreateToolhelp32Snapshot
+#include <stdio.h>    // For printf
+#include <wintrust.h> // For WinVerifyTrust
+#include <Softpub.h>  // For WINTRUST_ACTION_GENERIC_VERIFY_V2
+#pragma comment(lib, "wintrust.lib")
 
-#pragma pack(push, 1)
-typedef struct _SYSTEM_HANDLE {
-    ULONG       ProcessId;
-    BYTE        ObjectTypeNumber;
-    BYTE        Flags;
-    USHORT      Handle;
-    PVOID       Object;
-    ACCESS_MASK GrantedAccess;
-} SYSTEM_HANDLE;
-
-typedef struct _SYSTEM_HANDLE_INFORMATION {
-    ULONG HandleCount;
-    SYSTEM_HANDLE Handles[1];
-} SYSTEM_HANDLE_INFORMATION;
-
-#pragma pack(pop)
-
+// Define necessary NTSTATUS codes and information classes if not already defined
 #ifndef STATUS_INFO_LENGTH_MISMATCH
 #define STATUS_INFO_LENGTH_MISMATCH ((NTSTATUS)0xC0000004)
 #endif
@@ -36,346 +21,398 @@ typedef struct _SYSTEM_HANDLE_INFORMATION {
 #endif
 
 #ifndef SystemHandleInformation
-#define SystemHandleInformation 16
+#define SystemHandleInformation 16 // Used with NtQuerySystemInformation
 #endif
 
-#ifndef SystemProcessInformation
-#define SystemProcessInformation 5
+#ifndef ObjectTypeInformation
+#define ObjectTypeInformation 2 // Used with NtQueryObject
 #endif
 
-#include <wintrust.h>
-#include <Softpub.h>
+#ifndef DUPLICATE_SAME_ACCESS
+#define DUPLICATE_SAME_ACCESS 0x00000002 // Used with NtDuplicateObject
+#endif
 
-#pragma comment(lib, "wintrust.lib")
+// Typedefs for Native API functions
+typedef NTSTATUS(WINAPI* pNtQuerySystemInformation)(
+	SYSTEM_INFORMATION_CLASS SystemInformationClass,
+	PVOID SystemInformation,
+	ULONG SystemInformationLength,
+	PULONG ReturnLength
+	);
+
+typedef NTSTATUS(WINAPI* pNtQueryObject)(
+	HANDLE Handle,
+	OBJECT_INFORMATION_CLASS ObjectInformationClass,
+	PVOID ObjectInformation,
+	ULONG ObjectInformationLength,
+	PULONG ReturnLength
+	);
+
+typedef NTSTATUS(WINAPI* pNtDuplicateObject)(
+	HANDLE SourceProcessHandle,
+	HANDLE SourceHandle,
+	HANDLE TargetProcessHandle,
+	PHANDLE TargetHandle,
+	ACCESS_MASK DesiredAccess,
+	ULONG HandleAttributes,
+	ULONG Options
+	);
+
+#pragma pack(push, 1)
+typedef struct _SYSTEM_HANDLE {
+	ULONG       ProcessId;
+	BYTE        ObjectTypeNumber;
+	BYTE        Flags;
+	USHORT      Handle;
+	PVOID       Object;
+	ACCESS_MASK GrantedAccess;
+} SYSTEM_HANDLE;
+
+typedef struct _SYSTEM_HANDLE_INFORMATION {
+	ULONG HandleCount;
+	SYSTEM_HANDLE Handles[1]; // Flexible array member
+} SYSTEM_HANDLE_INFORMATION;
+
+typedef struct _OBJECT_TYPE_INFORMATION {
+	UNICODE_STRING TypeName;
+	ULONG TotalNumberOfObjects;
+	ULONG TotalNumberOfHandles;
+	ULONG TotalPagedPoolUsage;
+	ULONG TotalNonPagedPoolUsage;
+	ULONG TotalNamePoolUsage;
+	ULONG TotalHandleTableUsage;
+	ULONG HighWaterNumberOfObjects;
+	ULONG HighWaterNumberOfHandles;
+	ULONG HighWaterPagedPoolUsage;
+	ULONG HighWaterNonPagedPoolUsage;
+	ULONG HighWaterNamePoolUsage;
+	ULONG HighWaterHandleTableUsage;
+	ULONG InvalidAttributes;
+	GENERIC_MAPPING GenericMapping;
+	ULONG ValidAccessMask;
+	BOOLEAN SecurityRequired;
+	BOOLEAN MaintainHandleCount;
+	UCHAR TypeIndex;
+	CHAR ReservedByte;
+	ULONG PoolType;
+	ULONG DefaultPagedPoolCharge;
+	ULONG DefaultNonPagedPoolCharge;
+} OBJECT_TYPE_INFORMATION, * POBJECT_TYPE_INFORMATION;
+#pragma pack(pop)
+
+// Whitelist for specific executable paths (exact matches)
+static const wchar_t* whitelist_paths[] = {
+	L"C:\\Program Files\\Windows Defender\\NisSrv.exe",
+	NULL
+};
+
+// Whitelist for system directories (prefix matches)
+static const wchar_t* whitelisted_directories[] = {
+	L"C:\\Windows\\System32\\",
+	L"C:\\Windows\\SysWOW64\\",
+	L"C:\\Program Files\\",
+	L"C:\\Program Files (x86)\\",
+	L"C:\\Windows\\SystemApps\\",
+	NULL
+};
+
 
 static bool _umac_file_signed(LPCWSTR filePath)
 {
-    WINTRUST_FILE_INFO fileInfo = { 0 };
-    fileInfo.cbStruct = sizeof(WINTRUST_FILE_INFO);
-    fileInfo.pcwszFilePath = filePath;
-    fileInfo.hFile = NULL;
-    fileInfo.pgKnownSubject = NULL;
+	WINTRUST_FILE_INFO fileInfo = { 0 };
+	fileInfo.cbStruct = sizeof(WINTRUST_FILE_INFO);
+	fileInfo.pcwszFilePath = filePath;
 
-    GUID policyGUID = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+	GUID policyGUID = WINTRUST_ACTION_GENERIC_VERIFY_V2;
 
-    WINTRUST_DATA trustData = { 0 };
-    trustData.cbStruct = sizeof(WINTRUST_DATA);
-    trustData.pPolicyCallbackData = NULL;
-    trustData.pSIPClientData = NULL;
-    trustData.dwUIChoice = WTD_UI_NONE;
-    trustData.fdwRevocationChecks = WTD_REVOKE_NONE;
-    trustData.dwUnionChoice = WTD_CHOICE_FILE;
-    trustData.pFile = &fileInfo;
-    trustData.dwStateAction = WTD_STATEACTION_VERIFY;  // Fixed: was 0
-    trustData.hWVTStateData = NULL;
-    trustData.dwProvFlags = WTD_SAFER_FLAG;  // Fixed: was 0
-    trustData.dwUIContext = WTD_UICONTEXT_EXECUTE;  // Fixed: was 0
+	WINTRUST_DATA trustData = { 0 };
+	trustData.cbStruct = sizeof(WINTRUST_DATA);
+	trustData.dwUIChoice = WTD_UI_NONE;         // Do not display any UI
+	trustData.fdwRevocationChecks = WTD_REVOKE_NONE; // No revocation check for performance
+	trustData.dwUnionChoice = WTD_CHOICE_FILE;  // Verify a file
+	trustData.pFile = &fileInfo;
+	trustData.dwStateAction = WTD_STATEACTION_VERIFY; // Verify the signature
+	trustData.dwProvFlags = WTD_SAFER_FLAG;     // Apply SAFER policy checks
+	trustData.dwUIContext = WTD_UICONTEXT_EXECUTE; // Context for executing a file
 
-    LONG status = WinVerifyTrust(NULL, &policyGUID, &trustData);
+	LONG status = WinVerifyTrust(NULL, &policyGUID, &trustData);
 
-    // Clean up the state data
-    if (trustData.hWVTStateData != NULL)
-    {
-        trustData.dwStateAction = WTD_STATEACTION_CLOSE;
-        WinVerifyTrust(NULL, &policyGUID, &trustData);
-    }
+	if (trustData.hWVTStateData != NULL) 
+	{
+		trustData.dwStateAction = WTD_STATEACTION_CLOSE;
+		WinVerifyTrust(NULL, &policyGUID, &trustData);
+	}
 
-    // Check for various success conditions
-    switch (status)
-    {
-    case ERROR_SUCCESS:
-        return true;
-    case TRUST_E_NOSIGNATURE:
-        // File is not signed
-        return false;
-    case TRUST_E_EXPLICIT_DISTRUST:
-        // File is signed but signature is not trusted
-        return false;
-    case TRUST_E_SUBJECT_NOT_TRUSTED:
-        // File is signed but signer is not trusted
-        return false;
-    case CRYPT_E_SECURITY_SETTINGS:
-        // Security settings prevent verification
-        return false;
-    default:
-        // Other error occurred
-        return false;
-    }
+	return (status == ERROR_SUCCESS);
 }
-
-static const wchar_t* whitelist_paths[] = {
-    L"C:\\Windows\\System32\\csrss.exe",
-    L"C:\\Windows\\System32\\smss.exe",
-    L"C:\\Windows\\System32\\wininit.exe",
-    L"C:\\Windows\\System32\\ctfmon.exe",
-    L"C:\\Windows\\System32\\sihost.exe",
-    L"C:\\Windows\\System32\\oobe\\UserOOBEBroker.exe",
-    NULL
-};
 
 static bool is_whitelisted_process_path(const wchar_t* procPath)
 {
-    for (int i = 0; whitelist_paths[i] != NULL; ++i)
-    {
-        // Compare length first for a quick fail
-        size_t lenWhitelist = wcslen(whitelist_paths[i]);
-        size_t lenProcPath = wcslen(procPath);
-        if (lenWhitelist != lenProcPath)
-            continue;
+	if (!procPath) return false;
 
-        // Case-insensitive compare full path
-        if (_wcsicmp(procPath, whitelist_paths[i]) == 0)
-            return true;
-    }
-    return false;
+	// First, check for exact matches in the specific executable whitelist
+	for (int i = 0; whitelist_paths[i] != NULL; ++i) {
+		if (_wcsicmp(procPath, whitelist_paths[i]) == 0) {
+			return true;
+		}
+	}
+
+	for (int i = 0; whitelisted_directories[i] != NULL; ++i) 
+	{
+		size_t dir_len = wcslen(whitelisted_directories[i]);
+		if (_wcsnicmp(procPath, whitelisted_directories[i], dir_len) == 0) 
+		{
+			return true;
+		}
+	}
+
+	return false;
 }
 
-static inline SYSTEM_PROCESS_INFORMATION* _umac_query_process_list()
+static pNtQuerySystemInformation pNtQuerySystemInformation_ptr = NULL;
+static pNtQueryObject pNtQueryObject_ptr = NULL;
+static pNtDuplicateObject pNtDuplicateObject_ptr = NULL;
+
+static inline void _umac_init_ntdll_funcs()
 {
-    ULONG bufferSize = 0x10000;
-    NTSTATUS status;
-    SYSTEM_PROCESS_INFORMATION* buffer = NULL;
+	HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+	if (!ntdll) 
+	{
+		printf("UMAC: Error: Could not get handle to ntdll.dll!\n");
+		return;
+	}
 
-    pNtQuerySystemInformation NtQuerySystemInformation =
-        (pNtQuerySystemInformation)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQuerySystemInformation");
+	pNtQuerySystemInformation_ptr = (pNtQuerySystemInformation)GetProcAddress(ntdll, "NtQuerySystemInformation");
+	pNtQueryObject_ptr = (pNtQueryObject)GetProcAddress(ntdll, "NtQueryObject");
+	pNtDuplicateObject_ptr = (pNtDuplicateObject)GetProcAddress(ntdll, "NtDuplicateObject");
 
-    if (!NtQuerySystemInformation)
-        return NULL;
-
-    do {
-        buffer = (SYSTEM_PROCESS_INFORMATION*)malloc(bufferSize);
-        if (!buffer)
-            return NULL;
-
-        status = NtQuerySystemInformation(SystemProcessInformation, buffer, bufferSize, &bufferSize);
-        if (status == STATUS_INFO_LENGTH_MISMATCH) {
-            free(buffer);
-            buffer = NULL;
-            bufferSize *= 2;
-        }
-    } while (status == STATUS_INFO_LENGTH_MISMATCH);
-
-    if (!NT_SUCCESS(status)) {
-        free(buffer);
-        return NULL;
-    }
-
-    return buffer;
+	if (!pNtQuerySystemInformation_ptr || !pNtQueryObject_ptr || !pNtDuplicateObject_ptr) 
+	{
+		printf("UMAC: Error: Failed to get one or more NTDLL function addresses.\n");
+	}
 }
 
-static inline const wchar_t* _umac_get_process_name_by_pid(SYSTEM_PROCESS_INFORMATION* list, DWORD pid)
+#define SUSPICIOUS_ACCESS_MASK (PROCESS_VM_WRITE | PROCESS_VM_READ | PROCESS_VM_OPERATION | \
+                               PROCESS_CREATE_THREAD | PROCESS_DUP_HANDLE | PROCESS_SET_INFORMATION | \
+                               PROCESS_TERMINATE | PROCESS_SUSPEND_RESUME | PROCESS_SET_QUOTA | \
+                               PROCESS_SET_INFORMATION | PROCESS_VM_WRITE | PROCESS_SET_LIMITED_INFORMATION)
+
+static DWORD _umac_get_handle_target_pid(HANDLE hProcess, HANDLE hRemoteHandle)
 {
-    SYSTEM_PROCESS_INFORMATION* entry = list;
-    while (entry) {
-        if ((DWORD)(ULONG_PTR)entry->UniqueProcessId == pid) {
-            if (entry->ImageName.Length > 0)
-                return entry->ImageName.Buffer;
-            else
-                return L"[System Process]";
-        }
+	if (!pNtDuplicateObject_ptr) 
+	{
+		_umac_init_ntdll_funcs(); // Ensure functions are loaded
+		if (!pNtDuplicateObject_ptr) return 0;
+	}
 
-        if (entry->NextEntryOffset == 0)
-            break;
+	HANDLE hDuplicated = NULL;
+	NTSTATUS status = pNtDuplicateObject_ptr(
+		hProcess, hRemoteHandle, GetCurrentProcess(),
+		&hDuplicated, 0, 0, DUPLICATE_SAME_ACCESS
+	);
 
-        entry = (SYSTEM_PROCESS_INFORMATION*)((BYTE*)entry + entry->NextEntryOffset);
-    }
-    return L"[Unknown Process]";
+	if (!NT_SUCCESS(status)) 
+	{
+		// printf("UMAC: NtDuplicateObject failed with status 0x%X\n", status);
+		return 0;
+	}
+
+	DWORD targetPid = GetProcessId(hDuplicated);
+	CloseHandle(hDuplicated);
+
+	return targetPid;
 }
 
-#define SUSPICIOUS_ACCESS_MASK (PROCESS_VM_WRITE | PROCESS_VM_READ | PROCESS_VM_OPERATION | PROCESS_CREATE_THREAD | PROCESS_DUP_HANDLE)
-
-static inline bool _umac_check_suspicious_handles()
+static inline bool _umac_check_handles_to_self()
 {
-    HMODULE ntdll = GetModuleHandleA("ntdll.dll");
-    if (!ntdll) {
-        printf("UMAC: Failed to get ntdll handle\n");
-        return false;
-    }
+	if (!pNtQuerySystemInformation_ptr || !pNtDuplicateObject_ptr || !pNtQueryObject_ptr) 
+	{
+		_umac_init_ntdll_funcs();
+		if (!pNtQuerySystemInformation_ptr || !pNtDuplicateObject_ptr || !pNtQueryObject_ptr) return false;
+	}
 
-    pNtQuerySystemInformation NtQuerySystemInformation =
-        (pNtQuerySystemInformation)GetProcAddress(ntdll, "NtQuerySystemInformation");
-    if (!NtQuerySystemInformation) {
-        printf("UMAC: Failed to get NtQuerySystemInformation address\n");
-        return false;
-    }
+	ULONG bufferSize = 0x100000;
+	PBYTE buffer = NULL;
+	NTSTATUS status;
+	int retries = 0;
+	const int MAX_RETRIES = 5;
 
-    ULONG bufferSize = 0x100000;  // Start with 1MB buffer
-    PBYTE buffer = (PBYTE)malloc(bufferSize);
-    if (!buffer) {
-        printf("UMAC: Failed to allocate initial buffer\n");
-        return false;
-    }
+	UCHAR processObjectTypeIndex = 7;
 
-    NTSTATUS status;
-    int retries = 0;
-    do {
-        status = NtQuerySystemInformation(SystemHandleInformation, buffer, bufferSize, &bufferSize);
-        if (status == STATUS_INFO_LENGTH_MISMATCH) {
-            free(buffer);
-            bufferSize += 0x50000;  // Add 320KB each retry
-            buffer = (PBYTE)malloc(bufferSize);
-            if (!buffer) {
-                printf("UMAC: Failed to allocate buffer of size %lu\n", bufferSize);
-                return false;
-            }
-            printf("UMAC: Buffer too small, retrying with size %lu\n", bufferSize);
-        }
-        retries++;
-    } while (status == STATUS_INFO_LENGTH_MISMATCH && retries < 5);
+	do 
+	{
+		buffer = (PBYTE)realloc(buffer, bufferSize); // Use realloc to grow buffer
+		if (!buffer) 
+		{
+			printf("UMAC: Error: Failed to allocate buffer for SYSTEM_HANDLE_INFORMATION.\n");
+			return false;
+		}
 
-    if (!NT_SUCCESS(status)) {
-        printf("UMAC: NtQuerySystemInformation failed with status 0x%08X after %d retries\n", status, retries);
-        free(buffer);
-        return false;
-    }
+		status = pNtQuerySystemInformation_ptr(SystemHandleInformation, buffer, bufferSize, &bufferSize);
 
-    SYSTEM_HANDLE_INFORMATION* handleInfo = (SYSTEM_HANDLE_INFORMATION*)buffer;
-    DWORD currentPid = GetCurrentProcessId();
+		if (status != STATUS_INFO_LENGTH_MISMATCH && !NT_SUCCESS(status)) 
+		{
+			printf("UMAC: Error: NtQuerySystemInformation failed with status 0x%X\n", status);
+			free(buffer);
+			return false;
+		}
+		retries++;
+	}
+	while (status == STATUS_INFO_LENGTH_MISMATCH && retries < MAX_RETRIES);
 
-    bool foundSuspicious = false;
+	if (!NT_SUCCESS(status)) 
+	{
+		printf("UMAC: Final Error: NtQuerySystemInformation failed after retries with status 0x%X\n", status);
+		free(buffer);
+		return false;
+	}
 
-    for (ULONG i = 0; i < handleInfo->HandleCount; ++i) {
-        SYSTEM_HANDLE handle = handleInfo->Handles[i];
+	SYSTEM_HANDLE_INFORMATION* handleInfo = (SYSTEM_HANDLE_INFORMATION*)buffer;
+	DWORD currentPid = GetCurrentProcessId();
+	bool foundSuspicious = false;
 
-        // Skip system/idle processes
-        if (handle.ProcessId <= 4)
-            continue;
+	DWORD checkedProcesses[1024] = { 0 }; // Max 1024 unique PIDs
+	int checkedCount = 0;
 
-        // Skip our own process
-        if (handle.ProcessId == currentPid)
-            continue;
+	for (ULONG i = 0; i < handleInfo->HandleCount; ++i) 
+	{
+		SYSTEM_HANDLE handle = handleInfo->Handles[i];
 
-        // Check for process object types (common values across Windows versions)
-        if (handle.ObjectTypeNumber < 5 || handle.ObjectTypeNumber > 8)
-            continue;
+		if (handle.ProcessId <= 4 || handle.ProcessId == currentPid) 
+		{
+			continue;
+		}
 
-        // Check if this handle has any suspicious access rights
-        if (!(handle.GrantedAccess & SUSPICIOUS_ACCESS_MASK))
-            continue;
+		if (handle.ObjectTypeNumber != processObjectTypeIndex) 
+		{
+			continue;
+		}
 
-        // Now we need to determine if this handle points to OUR process
-        // We'll do this by trying to open the same process and comparing some properties
-        HANDLE hTargetProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, handle.ProcessId);
-        if (!hTargetProcess) {
-            continue;
-        }
+		bool alreadyChecked = false;
+		for (int j = 0; j < checkedCount; j++) 
+		{
+			if (checkedProcesses[j] == handle.ProcessId) 
+			{
+				alreadyChecked = true;
+				break;
+			}
+		}
+		if (alreadyChecked) 
+		{
+			continue;
+		}
 
-        // Get the process path for logging and whitelist checking
-        wchar_t processPath[MAX_PATH] = { 0 };
-        DWORD pathSize = MAX_PATH;
+		if (checkedCount < ARRAYSIZE(checkedProcesses)) 
+		{
+			checkedProcesses[checkedCount++] = handle.ProcessId;
+		}
+		else 
+		{
+			printf("UMAC: Warning: checkedProcesses array full, potential missed checks.\n");
+		}
 
-        if (!QueryFullProcessImageNameW(hTargetProcess, 0, processPath, &pathSize)) {
-            CloseHandle(hTargetProcess);
-            continue;
-        }
+		if (!(handle.GrantedAccess & SUSPICIOUS_ACCESS_MASK)) 
+		{
+			continue;
+		}
 
-        // Convert to char for printing
-        char cProcessPath[MAX_PATH];
-        WideCharToMultiByte(CP_UTF8, 0, processPath, -1, cProcessPath, MAX_PATH, NULL, NULL);
+		HANDLE hOwnerProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_DUP_HANDLE,
+			FALSE, handle.ProcessId);
+		if (!hOwnerProcess) 
+		{
+			continue;
+		}
 
-        // Check if this process is whitelisted
-        if (is_whitelisted_process_path(processPath)) {
-            CloseHandle(hTargetProcess);
-            continue;
-        }
+		DWORD targetPid = _umac_get_handle_target_pid(hOwnerProcess, (HANDLE)(uintptr_t)handle.Handle);
 
-        // Check code signing
-        if (_umac_file_signed(processPath)) {
-            CloseHandle(hTargetProcess);
-            continue;
-        }
+		if (targetPid == currentPid) 
+		{
+			wchar_t processPath[MAX_PATH] = { 0 };
+			DWORD pathSize = MAX_PATH;
 
-        // At this point, we have a suspicious handle from an unsigned process
-        // But we still need to verify it's actually a handle to OUR process
+			if (QueryFullProcessImageNameW(hOwnerProcess, 0, processPath, &pathSize)) 
+			{
+				if (!is_whitelisted_process_path(processPath) && !_umac_file_signed(processPath)) 
+				{
+					foundSuspicious = true;
+				}
+			}
+			else {
+				printf("UMAC: Warning: Could not get process image name for PID %lu (Error: %lu)\n", handle.ProcessId, GetLastError());
+			}
+		}
+		CloseHandle(hOwnerProcess);
+	}
 
-        // Simple heuristic: if a process has a handle with write access to ANY process
-        // and it's not whitelisted/signed, flag it as suspicious
-        // (More sophisticated detection would verify the handle target)
-
-        if (handle.GrantedAccess & (PROCESS_VM_WRITE | PROCESS_VM_READ | PROCESS_CREATE_THREAD)) {
-            printf("UMAC: SUSPICIOUS HANDLE DETECTED!\n");
-            printf("UMAC: Process: %s (PID: %lu)\n", cProcessPath, handle.ProcessId);
-            printf("UMAC: Access Rights: 0x%08X\n", handle.GrantedAccess);
-            printf("UMAC: Object Type: %d\n", handle.ObjectTypeNumber);
-
-            foundSuspicious = true;
-        }
-
-        CloseHandle(hTargetProcess);
-    }
-
-    free(buffer);
-    return foundSuspicious;
+	free(buffer);
+	return foundSuspicious;
 }
 
-
-// Alternative approach - enumerate handles to our specific process
-static inline bool _umac_check_handles_to_current_process()
+static inline bool _umac_check_process_handles()
 {
-    DWORD currentPid = GetCurrentProcessId();
+	HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+	if (snapshot == INVALID_HANDLE_VALUE) 
+	{
+		printf("UMAC: Error: CreateToolhelp32Snapshot failed (Error: %lu).\n", GetLastError());
+		return false;
+	}
 
-    // Get a snapshot of all processes
-    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (snapshot == INVALID_HANDLE_VALUE) {
-        return false;
-    }
+	PROCESSENTRY32W pe = { 0 };
+	pe.dwSize = sizeof(PROCESSENTRY32W);
 
-    PROCESSENTRY32 pe = { 0 };
-    pe.dwSize = sizeof(PROCESSENTRY32);
+	DWORD currentPid = GetCurrentProcessId();
+	bool foundSuspicious = false;
 
-    bool foundSuspicious = false;
+	if (Process32FirstW(snapshot, &pe)) 
+	{
+		do 
+		{
+			if (pe.th32ProcessID <= 4 || pe.th32ProcessID == currentPid) 
+			{
+				continue;
+			}
 
-    if (Process32First(snapshot, &pe)) {
-        do {
-            // Skip system processes and ourselves
-            if (pe.th32ProcessID <= 4 || pe.th32ProcessID == currentPid)
-                continue;
+			HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_DUP_HANDLE, FALSE, pe.th32ProcessID);
+			if (!hProcess) 
+			{
+				continue; // Cannot open
+			}
 
-            // Try to open this process to see if it has handles to us
-            HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, pe.th32ProcessID);
-            if (!hProcess)
-                continue;
+			HANDLE hTestHandle = NULL;
 
-            // Try to duplicate a handle to our process from this process
-            // This is a way to detect if the process has a handle to us
-            HANDLE hDuplicated = NULL;
-            if (DuplicateHandle(hProcess, (HANDLE)currentPid, GetCurrentProcess(),
-                &hDuplicated, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
+			if (DuplicateHandle(hProcess, GetCurrentProcess(), GetCurrentProcess(),
+				&hTestHandle, SUSPICIOUS_ACCESS_MASK, FALSE, 0)) 
+			{
 
-                printf("UMAC: Process %s (PID: %lu) has a handle to our process!\n",
-                    pe.szExeFile, pe.th32ProcessID);
+				wchar_t processPath[MAX_PATH] = { 0 };
+				DWORD pathSize = MAX_PATH;
 
-                // Check if this process should be trusted
-                wchar_t wProcessName[MAX_PATH];
-                MultiByteToWideChar(CP_UTF8, 0, pe.szExeFile, -1, wProcessName, MAX_PATH);
+				if (QueryFullProcessImageNameW(hProcess, 0, processPath, &pathSize)) 
+				{
+					if (!is_whitelisted_process_path(processPath) && !_umac_file_signed(processPath)) 
+					{
+						foundSuspicious = true;
+					}
+				}
+				CloseHandle(hTestHandle); // Always close duplicated handle
+			}
+			CloseHandle(hProcess); // Always close the opened process handle
+		} 
+		while (Process32NextW(snapshot, &pe));
+	}
 
-                if (!is_whitelisted_process_path(wProcessName) && !_umac_file_signed(wProcessName)) {
-                    printf("UMAC: SUSPICIOUS PROCESS DETECTED: %s\n", pe.szExeFile);
-                    foundSuspicious = true;
-                }
-
-                CloseHandle(hDuplicated);
-            }
-
-            CloseHandle(hProcess);
-
-        } while (Process32Next(snapshot, &pe));
-    }
-
-    CloseHandle(snapshot);
-    return foundSuspicious;
+	CloseHandle(snapshot);
+	return foundSuspicious;
 }
 
-// Updated main checking function to use both methods
 static inline bool _umac_check_handles()
 {
-    // Method 1: System handle enumeration
-    bool method1Result = _umac_check_suspicious_handles();
+	_umac_init_ntdll_funcs();
 
-    // Method 2: Process enumeration approach  
-    bool method2Result = _umac_check_handles_to_current_process();
+	bool method1_result = _umac_check_handles_to_self();
+	bool method2_result = _umac_check_process_handles();
 
-    return method1Result || method2Result;
+	return method1_result || method2_result;
 }
 
 #endif
