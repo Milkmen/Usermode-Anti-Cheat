@@ -39,7 +39,7 @@ static inline uint16_t umac_check_regular()
 	if(_umac_debugger_present()) vl |= UMAC_CHECK_DEBUGGER;
 #endif
 #ifndef UMAC_NO_HANDLE_CHECKS
-	if (_umac_check_suspicious_handles()) vl |= UMAC_CHECK_HANDLE;
+	if (_umac_check_handles()) vl |= UMAC_CHECK_HANDLE;
 #endif
 	return vl;
 }
